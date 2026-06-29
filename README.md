@@ -6,8 +6,6 @@ Link Youtube: https://youtu.be/pEo2SG3AI_g
 
 # VPN Client-to-Site — L2TP/IPSec
 
-**Autor:** Eunice F. Fleming | **Matrícula:** 2024-1185 | **Institución:** ITLA
-
 ---
 
 ## 1. Objetivo
