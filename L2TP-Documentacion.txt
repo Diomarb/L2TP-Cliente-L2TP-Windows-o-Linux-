@@ -1,0 +1,290 @@
+! ============================================================
+!  ISP - L2TP/IPSec IKEv1
+! ============================================================
+
+enable
+configure terminal
+hostname ISP
+
+interface Ethernet0/0
+ description Hacia R1
+ ip address 10.11.85.65 255.255.255.252
+ no shutdown
+
+interface Ethernet0/1
+ description Hacia R2
+ ip address 10.11.85.70 255.255.255.252
+ no shutdown
+
+
+ip route 10.11.85.0   255.255.255.192 10.11.85.66
+ip route 10.11.85.128 255.255.255.192 10.11.85.67
+ip route 10.11.85.192 255.255.255.240 10.11.85.67
+
+end
+
+
+! ============================================================
+!  R1 - Gateway NAT para cliente Kali
+! ============================================================
+
+enable
+configure terminal
+hostname R1
+
+interface Ethernet0/0
+ description LAN hacia Switch y Kali
+ ip address 10.11.85.1 255.255.255.192
+ ip nat inside
+ no shutdown
+
+interface Ethernet0/1
+ description WAN hacia ISP
+ ip address 10.11.85.66 255.255.255.252
+ ip nat outside
+ no shutdown
+
+ip route 0.0.0.0 0.0.0.0 10.11.85.65
+
+access-list 1 permit 10.11.85.0 0.0.0.63
+ip nat inside source list 1 interface Ethernet0/1 overload
+
+end
+
+
+! ============================================================
+!  R2 - Servidor VPN / LNS L2TP/IPSec IKEv1
+! ============================================================
+
+enable
+configure terminal
+hostname R2
+
+interface Ethernet0/0
+ description WAN hacia ISP
+ ip address 10.11.85.69 255.255.255.252
+ no shutdown
+
+interface Ethernet0/1
+ description LAN hacia PC1
+ ip address 10.11.85.129 255.255.255.192
+ no shutdown
+
+ip route 0.0.0.0 0.0.0.0 10.11.85.70
+
+aaa new-model
+aaa authentication ppp VPN-AUTH local
+aaa authorization network VPN-AUTH local
+
+username kali password ITLA2024-VPN
+
+ip local pool POOL-VPN 10.11.85.193 10.11.85.206
+
+crypto isakmp policy 10
+ encryption aes 256
+ hash sha256
+ authentication pre-share
+ group 14
+ lifetime 86400
+
+crypto isakmp key ITLA2024 address 0.0.0.0
+crypto isakmp identity address
+
+
+crypto ipsec transform-set TS-L2TP esp-aes 256 esp-sha256-hmac
+ mode transport
+
+
+crypto dynamic-map DYN-MAP 10
+ set transform-set TS-L2TP
+reverse-route
+ set pfs group2
+exit
+
+crypto map CMAP-L2TP 65535 ipsec-isakmp dynamic DYN-MAP
+interface Ethernet0/0
+ crypto map CMAP-L2TP
+exit
+
+vpdn enable
+
+vpdn-group L2TP-SERVER
+ accept-dialin
+  protocol l2tp
+  virtual-template 1
+ !
+ no l2tp tunnel authentication
+
+interface Virtual-Template1
+ ip unnumbered Ethernet0/1
+ peer default ip address pool POOL-VPN
+ ppp authentication ms-chap-v2 VPN-AUTH
+ ppp authorization VPN-AUTH
+
+end
+
+
+! ============================================================
+!  PC1 (VPCS)
+! ============================================================
+
+ip 10.11.85.130 255.255.255.192 10.11.85.129
+save
+
+
+
+# ============================================================
+#  Kali Linux - Cliente L2TP/IPSec IKEv1
+# ============================================================
+
+
+echo "[*] Configurando eth1..."
+
+sudo ip addr flush dev eth0
+sudo ip addr add 10.11.85.2/26 dev eth0
+sudo ip link set eth0 up
+
+
+# Esto le dice al kernel: "Para llegar a cualquier cosa en 10.11.85.0/26, usa eth1"
+sudo ip route add 10.11.85.0/26 dev eth0 src 10.11.85.2
+
+
+sudo ip route add default via 10.11.85.1 dev eth0
+
+echo "[+] eth0: 10.11.85.2/26 | GW: 10.11.85.1"
+
+echo "[*] Ping a R1 (gateway)..."
+ping -c 2 -W 2 10.11.85.1 && echo "[+] OK -> R1" || echo "FALLO -> R1, revisar conexión física en GNS3"
+
+echo "[*] Ping a R2 (servidor VPN)..."
+ping -c 2 -W 2 10.11.85.67 && echo "[+] OK -> R2" || echo "FALLO -> R2, revisar NAT en R1 y rutas en ISP"
+
+
+echo ""
+echo "[*] Instalando strongswan y xl2tpd..."
+sudo apt-get update -y -qq
+sudo apt-get install -y strongswan xl2tpd
+
+
+echo "[*] Escribiendo /etc/ipsec.conf..."
+sudo bash -c 'cat > /etc/ipsec.conf << EOF
+config setup
+    charondebug="ike 1, knl 1, cfg 0"
+    uniqueids=no
+
+conn L2TP-PSK
+    keyexchange=ikev1
+    authby=secret
+    type=transport
+    left=%defaultroute
+    leftprotoport=17/1701
+    right=10.11.85.69
+    rightprotoport=17/1701
+    rightid=10.11.85.69
+    ike=aes256-sha256-modp2048!
+    esp=aes256-sha256-modp2048!
+    pfs=yes
+    forceencaps=yes
+    dpdaction=clear
+    dpddelay=30s
+    dpdtimeout=120s
+    auto=add
+EOF'
+echo "[+] /etc/ipsec.conf OK"
+
+
+echo "[*] Escribiendo /etc/ipsec.secrets..."
+sudo bash -c 'cat > /etc/ipsec.secrets << EOF
+%any %any : PSK "ITLA2024"
+EOF'
+sudo chmod 600 /etc/ipsec.secrets
+echo "[+] /etc/ipsec.secrets OK"
+
+
+echo "[*] Escribiendo /etc/xl2tpd/xl2tpd.conf..."
+sudo bash -c 'cat > /etc/xl2tpd/xl2tpd.conf << EOF
+[global]
+port = 1701
+
+[lac l2tp-vpn]
+lns = 10.11.85.69
+ppp debug = yes
+pppoptfile = /etc/ppp/options.l2tpd.client
+length bit = yes
+EOF'
+echo "[+] /etc/xl2tpd/xl2tpd.conf OK"
+
+
+echo "[*] Escribiendo /etc/ppp/options.l2tpd.client..."
+sudo bash -c 'cat > /etc/ppp/options.l2tpd.client << EOF
+ipcp-accept-local
+ipcp-accept-remote
+refuse-eap
+require-mschap-v2
+noccp
+mtu 1400
+mru 1400
+noipdefault
+defaultroute
+usepeerdns
+connect-delay 5000
+name kali
+password ITLA2024-VPN
+EOF'
+echo "[+] /etc/ppp/options.l2tpd.client OK"
+
+
+sudo mkdir -p /var/run/xl2tpd
+sudo touch /var/run/xl2tpd/l2tp-control
+
+
+echo ""
+echo "[*] Reiniciando servicios..."
+sudo systemctl stop xl2tpd 2>/dev/null || true
+sudo systemctl stop strongswan-starter 2>/dev/null || true
+sleep 2
+
+sudo systemctl start strongswan-starter
+sleep 3
+sudo systemctl start xl2tpd
+sleep 2
+
+sudo systemctl is-active strongswan-starter && echo "[+] strongswan: ACTIVO" || echo "strongswan: FALLO"
+sudo systemctl is-active xl2tpd    && echo " xl2tpd:    ACTIVO" || echo "[!] xl2tpd:    FALLO"
+
+
+echo ""
+echo "[*] Levantando túnel IPSec hacia 10.11.85.69..."
+sudo ipsec up L2TP-PSK
+sleep 4
+
+echo "[*] Estado IPSec:"
+sudo ipsec status | grep -E "L2TP|ESTABLISHED|INSTALLED|ERROR" || echo "    Revisar con: sudo ipsec statusall"
+
+
+echo ""
+echo "[*] Iniciando sesión L2TP (usuario: kali)..."
+sudo bash -c 'echo "c l2tp-vpn" > /var/run/xl2tpd/l2tp-control'
+
+echo "[*] Esperando que ppp0 se levante (15 segundos)..."
+for i in $(seq 1 15); do
+    sleep 1
+    if ip link show ppp0 &>/dev/null; then
+        echo "[+] ppp0 detectada en ${i}s"
+        break
+    fi
+    echo "    ... ${i}s"
+done
+
+if ip link show ppp0 &>/dev/null; then
+    echo "[+] Agregando ruta hacia LAN de R2..."
+    sudo ip route add 10.11.85.128/26 dev ppp0 2>/dev/null && \
+        echo "[+] Ruta 10.11.85.128/26 via ppp0 OK" || \
+        echo "[*] Ruta ya existente"
+else
+    echo "ppp0 no se levantó. Ejecutar diagnóstico:"
+    echo "    sudo journalctl -u strongswan-starter -n 40 --no-pager"
+    echo "    sudo journalctl -u xl2tpd -n 40 --no-pager"
+    exit 1
+fi
+
